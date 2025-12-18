@@ -19,10 +19,16 @@ from sqlalchemy.orm import sessionmaker, declarative_base, relationship, Session
 # --------------------------------------------------------------------
 DATABASE_URL = os.getenv(
     "DATABASE_URL",
-    "postgresql+psycopg2://agentic_user:agentic_password@127.0.0.1:5432/agentic_db",
+    "sqlite:///./agentic.db",  # default for hosting/demo
+    # For Render/hosting you can later set DATABASE_URL to Postgres.
 )
 
-engine = create_engine(DATABASE_URL, future=True)
+connect_args = {}
+if DATABASE_URL.startswith("sqlite"):
+    connect_args = {"check_same_thread": False}
+
+engine = create_engine(DATABASE_URL, future=True, connect_args=connect_args)
+
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
@@ -64,8 +70,6 @@ class WeekProgress(Base):
 
     learner = relationship("Learner", back_populates="progress_items")
 
-
-Base.metadata.create_all(bind=engine)
 
 
 # --------------------------------------------------------------------
