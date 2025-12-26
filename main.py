@@ -27,7 +27,7 @@ if not DATABASE_URL:
 print(f"Using DATABASE_URL host: {DATABASE_URL.split('@')[1].split('/')[0]}")
 
 engine = create_engine(DATABASE_URL)
-    )
+
 
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
