@@ -21,12 +21,12 @@ except Exception:  # pragma: no cover
 DATABASE_URL = os.getenv("DATABASE_URL")
 
 # Render: if DATABASE_URL is not set, default to SQLite file (works on Render too)
-if DATABASE_URL:
-    engine = create_engine(DATABASE_URL)
-else:
-    engine = create_engine(
-        "sqlite:///./app.db",
-        connect_args={"check_same_thread": False},
+if not DATABASE_URL:
+    raise RuntimeError("DATABASE_URL is not set")
+
+print(f"Using DATABASE_URL host: {DATABASE_URL.split('@')[1].split('/')[0]}")
+
+engine = create_engine(DATABASE_URL)
     )
 
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
