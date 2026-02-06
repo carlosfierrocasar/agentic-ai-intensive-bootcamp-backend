@@ -299,3 +299,4 @@ def update_progress(learner_id: int, payload: ProgressUpdate, db: Session = Depe
     db.commit()
     db.refresh(row)
     return _to_out(row)
+    
