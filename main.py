@@ -8,29 +8,26 @@ from sqlalchemy import Column, Integer, String, create_engine
 from sqlalchemy.orm import Session, declarative_base, sessionmaker
 
 try:
-    # SQLAlchemy 1.4/2.0 JSON type
     from sqlalchemy import JSON
 except Exception:  # pragma: no cover
     JSON = None  # type: ignore
 
 
-# --------------------------------------------------------------------
-# DATABASE
-# --------------------------------------------------------------------
 DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL is not set")
 
-print(f"Using DATABASE_URL host: {DATABASE_URL.split('@')[1].split('/')[0]}")
+try:
+    host_part = DATABASE_URL.split("@", 1)[1].split("/", 1)[0]
+except Exception:
+    host_part = "<unknown>"
+print(f"Using DATABASE_URL host: {host_part}")
 
 engine = create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
 
-# --------------------------------------------------------------------
-# SCHEMAS
-# --------------------------------------------------------------------
 class WeekProgress(BaseModel):
     week: int
     modules_completed: int = 0
@@ -43,10 +40,7 @@ class LearnerCreate(BaseModel):
     source_role: str
     target_role: str
     start_week: int = Field(ge=1, le=7)
-
-    # Manual start date (NOT created_at). Editable later.
-    # Format: YYYY-MM-DD
-    start_date: Optional[str] = None
+    start_date: Optional[str] = None  # YYYY-MM-DD, manual + editable
 
     @field_validator("start_date")
     @classmethod
@@ -57,7 +51,6 @@ class LearnerCreate(BaseModel):
         if not v:
             return None
         import datetime as _dt
-
         try:
             _dt.date.fromisoformat(v)
         except Exception:
@@ -66,8 +59,7 @@ class LearnerCreate(BaseModel):
 
 
 class LearnerUpdate(BaseModel):
-    # Editable start date for existing learners
-    start_date: Optional[str] = None
+    start_date: Optional[str] = None  # editable for existing learners
 
     @field_validator("start_date")
     @classmethod
@@ -78,7 +70,6 @@ class LearnerUpdate(BaseModel):
         if not v:
             return None
         import datetime as _dt
-
         try:
             _dt.date.fromisoformat(v)
         except Exception:
@@ -96,33 +87,21 @@ class LearnerOut(BaseModel):
     source_role: str
     target_role: str
     start_week: int
-
-    # Manual, editable start date (YYYY-MM-DD)
     start_date: Optional[str] = None
-
     progress: List[WeekProgress]
     overall_modules_completed: int
     overall_modules_total: int
     overall_progress_pct: int
 
 
-# --------------------------------------------------------------------
-# MODEL HELPERS
-# --------------------------------------------------------------------
 def _week_totals() -> List[int]:
-    # 7 weeks, total = 34 (matches UI fallback)
     return [5, 5, 5, 5, 5, 5, 4]
 
 
 def _default_progress() -> List[dict]:
     totals = _week_totals()
     return [
-        {
-            "week": i + 1,
-            "modules_completed": 0,
-            "total_modules": totals[i],
-            "assessment_pct": 0,
-        }
+        {"week": i + 1, "modules_completed": 0, "total_modules": totals[i], "assessment_pct": 0}
         for i in range(7)
     ]
 
@@ -138,9 +117,6 @@ def _overall(progress: List[dict]) -> dict:
     }
 
 
-# --------------------------------------------------------------------
-# DB MODEL
-# --------------------------------------------------------------------
 class Learner(Base):
     __tablename__ = "learners"
 
@@ -149,37 +125,30 @@ class Learner(Base):
     source_role = Column(String, nullable=False)
     target_role = Column(String, nullable=False)
     start_week = Column(Integer, nullable=False)
-
-    # Manual, editable start date (YYYY-MM-DD). Nullable for existing learners.
     start_date = Column(String, nullable=True)
 
-    # Store progress as JSON (Postgres) or TEXT-backed JSON (SQLite fallback)
     if JSON is not None:
         progress = Column(JSON, nullable=False)
     else:
         from sqlalchemy import Text
-
         progress = Column(Text, nullable=False)
 
 
-# --------------------------------------------------------------------
-# APP
-# --------------------------------------------------------------------
 app = FastAPI(title="Agentic Bootcamp Backend")
+
+# ✅ Render crash fix: add middleware HERE (not inside startup)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 @app.on_event("startup")
 def on_startup():
-    # Ensure tables exist on fresh deployments
     Base.metadata.create_all(bind=engine)
-
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=["*"],
-        allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
-    )
 
 
 def get_db():
@@ -192,11 +161,8 @@ def get_db():
 
 def _to_out(row: Learner) -> LearnerOut:
     progress = row.progress
-
-    # row.progress might be list[dict] (JSON) or a string (fallback)
     if isinstance(progress, str):
         import json
-
         try:
             progress = json.loads(progress)
         except Exception:
@@ -205,21 +171,15 @@ def _to_out(row: Learner) -> LearnerOut:
     if not isinstance(progress, list):
         progress = _default_progress()
 
-    # validate shape and fill missing keys
     totals = _week_totals()
     normalized: List[dict] = []
-
     for i in range(7):
         week_num = i + 1
-        base = {
-            "week": week_num,
-            "modules_completed": 0,
-            "total_modules": totals[i],
-            "assessment_pct": 0,
-        }
+        base = {"week": week_num, "modules_completed": 0, "total_modules": totals[i], "assessment_pct": 0}
         found = next((p for p in progress if int(p.get("week", 0)) == week_num), None)
         if isinstance(found, dict):
-            base.update({k: found.get(k, base[k]) for k in base.keys()})
+            for k in base.keys():
+                base[k] = found.get(k, base[k])
         normalized.append(base)
 
     ov = _overall(normalized)
@@ -236,9 +196,6 @@ def _to_out(row: Learner) -> LearnerOut:
     )
 
 
-# --------------------------------------------------------------------
-# ENDPOINTS
-# --------------------------------------------------------------------
 @app.get("/learners", response_model=List[LearnerOut])
 def list_learners(db: Session = Depends(get_db)):
     rows = db.query(Learner).order_by(Learner.id.asc()).all()
@@ -267,9 +224,7 @@ def update_learner(learner_id: int, payload: LearnerUpdate, db: Session = Depend
     if not row:
         raise HTTPException(status_code=404, detail="Learner not found")
 
-    # Only field we support today: start_date (manual + editable)
     row.start_date = payload.start_date
-
     db.add(row)
     db.commit()
     db.refresh(row)
@@ -292,11 +247,8 @@ def update_progress(learner_id: int, payload: ProgressUpdate, db: Session = Depe
     if not row:
         raise HTTPException(status_code=404, detail="Learner not found")
 
-    # store as list[dict]
     row.progress = [item.model_dump() for item in payload.items]
-
     db.add(row)
     db.commit()
     db.refresh(row)
     return _to_out(row)
-    
