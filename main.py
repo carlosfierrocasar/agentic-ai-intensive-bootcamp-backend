@@ -251,3 +251,52 @@ def update_progress(learner_id: int, payload: ProgressUpdate, db: Session = Depe
     db.commit()
     db.refresh(row)
     return _to_out(row)
+
+from pydantic import BaseModel
+from fastapi import Depends
+from sqlalchemy.orm import Session
+from database import get_db
+from models import Learner, Assessment
+
+
+class AssessmentWebhook(BaseModel):
+    email: str
+    week: int
+    track: str
+    score: int
+
+
+@app.post("/assessment-webhook")
+def assessment_webhook(data: AssessmentWebhook, db: Session = Depends(get_db)):
+
+    learner = db.query(Learner).filter(Learner.email == data.email).first()
+    if not learner:
+        return {"error": "Learner not found"}
+
+    new_assessment = Assessment(
+        learner_id=learner.id,
+        week=data.week,
+        track=data.track,
+        score=data.score
+    )
+
+    db.add(new_assessment)
+    db.commit()
+
+    return {"status": "saved"}
+
+
+    from sqlalchemy import Column, Integer, String, ForeignKey, DateTime
+from sqlalchemy.sql import func
+from database import Base
+
+
+class Assessment(Base):
+    __tablename__ = "assessments"
+
+    id = Column(Integer, primary_key=True, index=True)
+    learner_id = Column(Integer, ForeignKey("learners.id"))
+    week = Column(Integer, nullable=False)
+    track = Column(String, nullable=False)
+    score = Column(Integer, nullable=False)
+    submitted_at = Column(DateTime(timezone=True), server_default=func.now())
