@@ -5,8 +5,9 @@ from datetime import date
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, field_validator
-from sqlalchemy import Column, Integer, String, Date, create_engine
+from sqlalchemy import Column, Integer, String, Date, DateTime, ForeignKey, create_engine
 from sqlalchemy.orm import Session, declarative_base, sessionmaker
+from sqlalchemy.sql import func
 
 try:
     from sqlalchemy import JSON
@@ -56,6 +57,7 @@ def _parse_start_date(v):
 
 class LearnerCreate(BaseModel):
     name: str
+    email: Optional[str] = None
     source_role: str
     target_role: str
     start_week: int = Field(ge=1, le=7)
@@ -69,6 +71,7 @@ class LearnerCreate(BaseModel):
 
 class LearnerUpdate(BaseModel):
     start_date: Optional[date] = None  # editable for existing learners
+    email: Optional[str] = None
 
     @field_validator("start_date", mode="before")
     @classmethod
@@ -83,6 +86,7 @@ class ProgressUpdate(BaseModel):
 class LearnerOut(BaseModel):
     id: int
     name: str
+    email: Optional[str] = None
     source_role: str
     target_role: str
     start_week: int
@@ -121,6 +125,7 @@ class Learner(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     name = Column(String, nullable=False)
+    email = Column(String, nullable=True)
     source_role = Column(String, nullable=False)
     target_role = Column(String, nullable=False)
     start_week = Column(Integer, nullable=False)
@@ -131,6 +136,17 @@ class Learner(Base):
     else:
         from sqlalchemy import Text
         progress = Column(Text, nullable=False)
+
+
+class Assessment(Base):
+    __tablename__ = "assessments"
+
+    id = Column(Integer, primary_key=True, index=True)
+    learner_id = Column(Integer, ForeignKey("learners.id"), nullable=False)
+    week = Column(Integer, nullable=False)
+    track = Column(String, nullable=False)
+    score = Column(Integer, nullable=False)
+    submitted_at = Column(DateTime(timezone=True), server_default=func.now())
 
 
 app = FastAPI(title="Agentic Bootcamp Backend")
@@ -156,6 +172,55 @@ def get_db():
         yield db
     finally:
         db.close()
+
+
+class AssessmentWebhook(BaseModel):
+    email: str
+    week: int = Field(ge=1, le=7)
+    track: str
+    score: int
+
+    @field_validator("track", mode="before")
+    @classmethod
+    def normalize_track(cls, v):
+        if v is None:
+            return v
+        return str(v).strip().lower()
+
+    @field_validator("score", mode="before")
+    @classmethod
+    def parse_score(cls, v):
+        # Accept int or strings like "8 / 10"
+        if isinstance(v, int):
+            return v
+        s = str(v).strip()
+        if "/" in s:
+            s = s.split("/", 1)[0].strip()
+        return int(s)
+
+
+@app.post("/assessment-webhook")
+def assessment_webhook(payload: AssessmentWebhook, db: Session = Depends(get_db)):
+    # Find learner by email. Requires learners.email to be populated.
+    learner = db.query(Learner).filter(Learner.email == payload.email).first()
+    if not learner:
+        raise HTTPException(status_code=404, detail="Learner not found for email")
+
+    assessment = Assessment(
+        learner_id=learner.id,
+        week=payload.week,
+        track=payload.track,
+        score=payload.score,
+    )
+    db.add(assessment)
+    db.commit()
+    db.refresh(assessment)
+
+    return {
+        "status": "saved",
+        "assessment_id": assessment.id,
+        "passed": payload.score >= 7,
+    }
 
 
 def _to_out(row: Learner) -> LearnerOut:
@@ -251,85 +316,3 @@ def update_progress(learner_id: int, payload: ProgressUpdate, db: Session = Depe
     db.commit()
     db.refresh(row)
     return _to_out(row)
-
-from pydantic import BaseModel
-from fastapi import Depends
-from sqlalchemy.orm import Session
-from database import get_db
-from models import Learner, Assessment
-
-
-class AssessmentWebhook(BaseModel):
-    email: str
-    week: int
-    track: str
-    score: int
-
-
-@app.post("/assessment-webhook")
-def assessment_webhook(data: AssessmentWebhook, db: Session = Depends(get_db)):
-
-    learner = db.query(Learner).filter(Learner.email == data.email).first()
-    if not learner:
-        return {"error": "Learner not found"}
-
-    new_assessment = Assessment(
-        learner_id=learner.id,
-        week=data.week,
-        track=data.track,
-        score=data.score
-    )
-
-    db.add(new_assessment)
-    db.commit()
-
-    return {"status": "saved"}
-
-
-    from sqlalchemy import Column, Integer, String, ForeignKey, DateTime
-from sqlalchemy.sql import func
-from database import Base
-
-
-class Assessment(Base):
-    __tablename__ = "assessments"
-
-    id = Column(Integer, primary_key=True, index=True)
-    learner_id = Column(Integer, ForeignKey("learners.id"))
-    week = Column(Integer, nullable=False)
-    track = Column(String, nullable=False)
-    score = Column(Integer, nullable=False)
-    submitted_at = Column(DateTime(timezone=True), server_default=func.now())
-
-    from pydantic import BaseModel
-from fastapi import Depends
-from sqlalchemy.orm import Session
-from database import get_db
-from models import Learner, Assessment
-
-
-class AssessmentWebhook(BaseModel):
-    email: str
-    week: int
-    track: str
-    score: int
-
-
-@app.post("/assessment-webhook")
-def assessment_webhook(data: AssessmentWebhook, db: Session = Depends(get_db)):
-
-    learner = db.query(Learner).filter(Learner.email == data.email).first()
-    if not learner:
-        return {"error": "Learner not found"}
-
-    new_assessment = Assessment(
-        learner_id=learner.id,
-        week=data.week,
-        track=data.track,
-        score=data.score
-    )
-
-    db.add(new_assessment)
-    db.commit()
-
-    return {"status": "saved"}
