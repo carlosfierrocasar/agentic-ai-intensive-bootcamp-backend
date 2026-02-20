@@ -300,3 +300,36 @@ class Assessment(Base):
     track = Column(String, nullable=False)
     score = Column(Integer, nullable=False)
     submitted_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    from pydantic import BaseModel
+from fastapi import Depends
+from sqlalchemy.orm import Session
+from database import get_db
+from models import Learner, Assessment
+
+
+class AssessmentWebhook(BaseModel):
+    email: str
+    week: int
+    track: str
+    score: int
+
+
+@app.post("/assessment-webhook")
+def assessment_webhook(data: AssessmentWebhook, db: Session = Depends(get_db)):
+
+    learner = db.query(Learner).filter(Learner.email == data.email).first()
+    if not learner:
+        return {"error": "Learner not found"}
+
+    new_assessment = Assessment(
+        learner_id=learner.id,
+        week=data.week,
+        track=data.track,
+        score=data.score
+    )
+
+    db.add(new_assessment)
+    db.commit()
+
+    return {"status": "saved"}
