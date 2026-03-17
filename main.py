@@ -1,5 +1,5 @@
 import os
-from typing import List, Optional
+from typing import Dict, List, Optional
 from datetime import date
 
 from fastapi import Depends, FastAPI, HTTPException
@@ -56,7 +56,7 @@ def _parse_start_date(v):
 
 class LearnerCreate(BaseModel):
     name: str
-    email: str
+    email: Optional[str] = None
     source_role: str
     target_role: str
     start_week: int = Field(ge=1, le=7)
@@ -71,6 +71,7 @@ class LearnerCreate(BaseModel):
 class LearnerUpdate(BaseModel):
     email: Optional[str] = None
     start_date: Optional[date] = None  # editable for existing learners
+    day_checks: Optional[Dict[str, bool]] = None
 
     @field_validator("start_date", mode="before")
     @classmethod
@@ -98,6 +99,7 @@ class LearnerOut(BaseModel):
     target_role: str
     start_week: int
     start_date: Optional[date] = None
+    day_checks: Dict[str, bool] = Field(default_factory=dict)
     progress: List[WeekProgress]
     overall_modules_completed: int
     overall_modules_total: int
@@ -115,6 +117,11 @@ def _default_progress() -> List[dict]:
         for i in range(7)
     ]
 
+
+
+
+def _default_day_checks() -> Dict[str, bool]:
+    return {}
 
 PASSING_SCORE = 7  # score out of 10 required to pass
 
@@ -144,9 +151,11 @@ class Learner(Base):
 
     if JSON is not None:
         progress = Column(JSON, nullable=False)
+        day_checks = Column(JSON, nullable=False, default=dict)
     else:
         from sqlalchemy import Text
         progress = Column(Text, nullable=False)
+        day_checks = Column(Text, nullable=False, default="{}")
 
 
 
@@ -200,6 +209,19 @@ def _to_out(row: Learner) -> LearnerOut:
     if not isinstance(progress, list):
         progress = _default_progress()
 
+    day_checks = getattr(row, "day_checks", None)
+    if isinstance(day_checks, str):
+        import json
+        try:
+            day_checks = json.loads(day_checks)
+        except Exception:
+            day_checks = _default_day_checks()
+
+    if not isinstance(day_checks, dict):
+        day_checks = _default_day_checks()
+
+    day_checks = {str(k): bool(v) for k, v in day_checks.items()}
+
     totals = _week_totals()
     normalized: List[dict] = []
     for i in range(7):
@@ -222,6 +244,7 @@ def _to_out(row: Learner) -> LearnerOut:
         target_role=row.target_role,
         start_week=row.start_week,
         start_date=row.start_date,
+        day_checks=day_checks,
         progress=[WeekProgress(**p) for p in normalized],
         **ov,
     )
@@ -290,6 +313,7 @@ def create_learner(payload: LearnerCreate, db: Session = Depends(get_db)):
         start_week=payload.start_week,
         start_date=payload.start_date,
         progress=_default_progress(),
+        day_checks=_default_day_checks(),
     )
     db.add(row)
     db.commit()
@@ -306,6 +330,8 @@ def update_learner(learner_id: int, payload: LearnerUpdate, db: Session = Depend
     row.start_date = payload.start_date
     if payload.email is not None:
         row.email = payload.email
+    if payload.day_checks is not None:
+        row.day_checks = {str(k): bool(v) for k, v in payload.day_checks.items()}
     db.add(row)
     db.commit()
     db.refresh(row)
