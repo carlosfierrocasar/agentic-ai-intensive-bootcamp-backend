@@ -411,25 +411,13 @@ def update_progress(learner_id: int, payload: ProgressUpdate, db: Session = Depe
     if not row:
         raise HTTPException(status_code=404, detail="Learner not found")
 
-    # assessment_pct is server-controlled (updated only via /assessment-webhook).
-    existing = row.progress
-    if isinstance(existing, str):
-        import json as _json
-        try:
-            existing = _json.loads(existing)
-        except Exception:
-            existing = _default_progress()
-    if not isinstance(existing, list):
-        existing = _default_progress()
-
-    existing_by_week = {int(p.get("week", 0)): int(p.get("assessment_pct", 0) or 0) for p in existing if isinstance(p, dict)}
-
     items = []
     for item in payload.items:
         d = item.model_dump()
-        wk = int(d.get("week", 0) or 0)
-        if wk in existing_by_week:
-            d["assessment_pct"] = existing_by_week[wk]
+        d["week"] = int(d.get("week", 0) or 0)
+        d["modules_completed"] = max(0, int(d.get("modules_completed", 0) or 0))
+        d["total_modules"] = max(0, int(d.get("total_modules", 0) or 0))
+        d["assessment_pct"] = max(0, min(100, int(d.get("assessment_pct", 0) or 0)))
         items.append(d)
 
     row.progress = items
