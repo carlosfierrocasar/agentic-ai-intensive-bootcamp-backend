@@ -1,4 +1,5 @@
 import os
+import json
 from typing import Dict, List, Optional
 from datetime import date
 
@@ -123,6 +124,88 @@ def _default_progress() -> List[dict]:
 def _default_day_checks() -> Dict[str, bool]:
     return {}
 
+
+def _normalize_progress(progress) -> List[dict]:
+    if isinstance(progress, str):
+        try:
+            progress = json.loads(progress)
+        except Exception:
+            progress = _default_progress()
+
+    if not isinstance(progress, list):
+        progress = _default_progress()
+
+    totals = _week_totals()
+    normalized: List[dict] = []
+    for i in range(7):
+        week_num = i + 1
+        base = {
+            "week": week_num,
+            "modules_completed": 0,
+            "total_modules": totals[i],
+            "assessment_pct": 0,
+        }
+        found = next(
+            (
+                p for p in progress
+                if isinstance(p, dict) and int(p.get("week", 0) or 0) == week_num
+            ),
+            None,
+        )
+        if isinstance(found, dict):
+            base["modules_completed"] = int(found.get("modules_completed", 0) or 0)
+            base["total_modules"] = int(found.get("total_modules", totals[i]) or totals[i])
+            base["assessment_pct"] = int(found.get("assessment_pct", 0) or 0)
+
+        base["modules_completed"] = max(0, min(base["modules_completed"], base["total_modules"]))
+        normalized.append(base)
+
+    return normalized
+
+
+def _normalize_day_checks(day_checks) -> Dict[str, bool]:
+    if isinstance(day_checks, str):
+        try:
+            day_checks = json.loads(day_checks)
+        except Exception:
+            day_checks = _default_day_checks()
+
+    if not isinstance(day_checks, dict):
+        day_checks = _default_day_checks()
+
+    return {str(k): bool(v) for k, v in day_checks.items()}
+
+
+def _sync_progress_from_day_checks(progress, day_checks) -> List[dict]:
+    normalized = _normalize_progress(progress)
+    checks = _normalize_day_checks(day_checks)
+
+    for i, week in enumerate(normalized):
+        start_day = i * 5 + 1
+        total_days = int(week["total_modules"])
+        completed = 0
+        for offset in range(total_days):
+            if checks.get(f"day_{start_day + offset}", False):
+                completed += 1
+        week["modules_completed"] = completed
+
+    return normalized
+
+
+def _sync_day_checks_from_progress(day_checks, progress) -> Dict[str, bool]:
+    checks = _normalize_day_checks(day_checks)
+    normalized = _normalize_progress(progress)
+
+    for i, week in enumerate(normalized):
+        start_day = i * 5 + 1
+        total_days = int(week["total_modules"])
+        completed = max(0, min(int(week["modules_completed"]), total_days))
+        for offset in range(total_days):
+            checks[f"day_{start_day + offset}"] = offset < completed
+
+    return checks
+
+
 PASSING_SCORE = 7  # score out of 10 required to pass
 
 
@@ -198,42 +281,14 @@ def get_db():
 
 
 def _to_out(row: Learner) -> LearnerOut:
-    progress = row.progress
-    if isinstance(progress, str):
-        import json
-        try:
-            progress = json.loads(progress)
-        except Exception:
-            progress = _default_progress()
+    progress = _normalize_progress(row.progress)
+    day_checks = _normalize_day_checks(getattr(row, "day_checks", None))
 
-    if not isinstance(progress, list):
-        progress = _default_progress()
+    # day_checks is the source of truth for Training Schedule,
+    # so reflect it back into weekly progress before returning.
+    progress = _sync_progress_from_day_checks(progress, day_checks)
 
-    day_checks = getattr(row, "day_checks", None)
-    if isinstance(day_checks, str):
-        import json
-        try:
-            day_checks = json.loads(day_checks)
-        except Exception:
-            day_checks = _default_day_checks()
-
-    if not isinstance(day_checks, dict):
-        day_checks = _default_day_checks()
-
-    day_checks = {str(k): bool(v) for k, v in day_checks.items()}
-
-    totals = _week_totals()
-    normalized: List[dict] = []
-    for i in range(7):
-        week_num = i + 1
-        base = {"week": week_num, "modules_completed": 0, "total_modules": totals[i], "assessment_pct": 0}
-        found = next((p for p in progress if int(p.get("week", 0)) == week_num), None)
-        if isinstance(found, dict):
-            for k in base.keys():
-                base[k] = found.get(k, base[k])
-        normalized.append(base)
-
-    ov = _overall(normalized)
+    ov = _overall(progress)
 
     return LearnerOut(
         id=row.id,
@@ -245,7 +300,7 @@ def _to_out(row: Learner) -> LearnerOut:
         start_week=row.start_week,
         start_date=row.start_date,
         day_checks=day_checks,
-        progress=[WeekProgress(**p) for p in normalized],
+        progress=[WeekProgress(**p) for p in progress],
         **ov,
     )
 
@@ -331,7 +386,9 @@ def update_learner(learner_id: int, payload: LearnerUpdate, db: Session = Depend
     if payload.email is not None:
         row.email = payload.email
     if payload.day_checks is not None:
-        row.day_checks = {str(k): bool(v) for k, v in payload.day_checks.items()}
+        normalized_day_checks = _normalize_day_checks(payload.day_checks)
+        row.day_checks = normalized_day_checks
+        row.progress = _sync_progress_from_day_checks(row.progress, normalized_day_checks)
     db.add(row)
     db.commit()
     db.refresh(row)
@@ -376,6 +433,7 @@ def update_progress(learner_id: int, payload: ProgressUpdate, db: Session = Depe
         items.append(d)
 
     row.progress = items
+    row.day_checks = _sync_day_checks_from_progress(getattr(row, "day_checks", None), items)
     db.add(row)
     db.commit()
     db.refresh(row)
