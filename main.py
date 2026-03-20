@@ -1,13 +1,14 @@
 import os
 import json
-from typing import Dict, List, Optional
-from datetime import date
+from typing import Any, Dict, List, Optional
+from datetime import date, datetime
 
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import Column, Integer, String, Date, DateTime, ForeignKey, create_engine, func
 from sqlalchemy.orm import Session, declarative_base, sessionmaker, relationship
+from openpyxl import load_workbook
 
 try:
     from sqlalchemy import JSON
@@ -36,6 +37,7 @@ class WeekProgress(BaseModel):
     total_modules: int
     assessment_pct: int = 0
 
+
 def _parse_start_date(v):
     """Accepts None, '', 'YYYY-MM-DD' strings, or date objects; returns date or None."""
     if v is None:
@@ -46,13 +48,11 @@ def _parse_start_date(v):
         s = v.strip()
         if not s:
             return None
-        # Validate ISO date format
         try:
             return date.fromisoformat(s)
         except Exception as e:
             raise ValueError("start_date must be in YYYY-MM-DD format") from e
     raise ValueError("start_date must be a date or YYYY-MM-DD string")
-
 
 
 class LearnerCreate(BaseModel):
@@ -61,7 +61,7 @@ class LearnerCreate(BaseModel):
     source_role: str
     target_role: str
     start_week: int = Field(ge=1, le=7)
-    start_date: Optional[date] = None  # YYYY-MM-DD, manual + editable
+    start_date: Optional[date] = None
 
     @field_validator("start_date", mode="before")
     @classmethod
@@ -71,7 +71,7 @@ class LearnerCreate(BaseModel):
 
 class LearnerUpdate(BaseModel):
     email: Optional[str] = None
-    start_date: Optional[date] = None  # editable for existing learners
+    start_date: Optional[date] = None
     day_checks: Optional[Dict[str, bool]] = None
 
     @field_validator("start_date", mode="before")
@@ -91,6 +91,12 @@ class AssessmentWebhook(BaseModel):
     score: int = Field(ge=0, le=10)
 
 
+class ExcelSyncInput(BaseModel):
+    filename: str = "assessment_results.xlsx"
+    week: int = Field(default=1, ge=1, le=7)
+    track: str = "engineer"
+
+
 class LearnerOut(BaseModel):
     id: int
     name: str
@@ -107,6 +113,9 @@ class LearnerOut(BaseModel):
     overall_progress_pct: int
 
 
+PASSING_SCORE = 7
+
+
 def _week_totals() -> List[int]:
     return [5, 5, 5, 5, 5, 5, 4]
 
@@ -117,8 +126,6 @@ def _default_progress() -> List[dict]:
         {"week": i + 1, "modules_completed": 0, "total_modules": totals[i], "assessment_pct": 0}
         for i in range(7)
     ]
-
-
 
 
 def _default_day_checks() -> Dict[str, bool]:
@@ -206,9 +213,6 @@ def _sync_day_checks_from_progress(day_checks, progress) -> Dict[str, bool]:
     return checks
 
 
-PASSING_SCORE = 7  # score out of 10 required to pass
-
-
 def _overall(progress: List[dict]) -> dict:
     total = sum(int(p.get("total_modules", 0)) for p in progress)
     completed = sum(int(p.get("modules_completed", 0)) for p in progress)
@@ -241,8 +245,6 @@ class Learner(Base):
         day_checks = Column(Text, nullable=False, default="{}")
 
 
-
-
 class Assessment(Base):
     __tablename__ = "assessments"
 
@@ -255,9 +257,9 @@ class Assessment(Base):
 
     learner = relationship("Learner")
 
+
 app = FastAPI(title="Agentic Bootcamp Backend")
 
-# ✅ Render crash fix: add middleware HERE (not inside startup)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -283,11 +285,7 @@ def get_db():
 def _to_out(row: Learner) -> LearnerOut:
     progress = _normalize_progress(row.progress)
     day_checks = _normalize_day_checks(getattr(row, "day_checks", None))
-
-    # day_checks is the source of truth for Training Schedule,
-    # so reflect it back into weekly progress before returning.
     progress = _sync_progress_from_day_checks(progress, day_checks)
-
     ov = _overall(progress)
 
     return LearnerOut(
@@ -305,29 +303,28 @@ def _to_out(row: Learner) -> LearnerOut:
     )
 
 
-
-@app.post("/assessment-webhook")
-def assessment_webhook(payload: AssessmentWebhook, db: Session = Depends(get_db)):
-    # Find learner by email
-    learner = db.query(Learner).filter(Learner.email == payload.email).first()
-    if not learner:
-        raise HTTPException(status_code=404, detail="Learner not found for email")
-
+def _apply_assessment_result(
+    db: Session,
+    learner: Learner,
+    week: int,
+    track: str,
+    score: int,
+    submitted_at: Optional[datetime] = None,
+) -> Assessment:
     assessment = Assessment(
         learner_id=learner.id,
-        week=payload.week,
-        track=payload.track,
-        score=payload.score,
+        week=week,
+        track=track,
+        score=score,
     )
+    if submitted_at is not None:
+        assessment.submitted_at = submitted_at
     db.add(assessment)
 
-    passed = payload.score >= PASSING_SCORE
-
-    # Overall server-controlled assessment percent: stays 100 once passed.
+    passed = score >= PASSING_SCORE
     if passed and int(getattr(learner, "assessment_pct", 0) or 0) < 100:
         learner.assessment_pct = 100
 
-    # Also reflect pass in per-week progress JSON (for UI)
     progress = learner.progress
     if isinstance(progress, str):
         try:
@@ -338,18 +335,146 @@ def assessment_webhook(payload: AssessmentWebhook, db: Session = Depends(get_db)
         progress = _default_progress()
 
     for p in progress:
-        if isinstance(p, dict) and int(p.get("week", 0) or 0) == payload.week:
+        if isinstance(p, dict) and int(p.get("week", 0) or 0) == week:
             if passed and int(p.get("assessment_pct", 0) or 0) < 100:
                 p["assessment_pct"] = 100
             break
 
     learner.progress = progress
-
     db.add(learner)
+    return assessment
+
+
+def _parse_excel_datetime(value: Any) -> Optional[datetime]:
+    if value is None or value == "":
+        return None
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, date):
+        return datetime.combine(value, datetime.min.time())
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        for fmt in (
+            "%Y-%m-%d %H:%M:%S",
+            "%Y-%m-%d %H:%M",
+            "%m/%d/%Y %H:%M:%S",
+            "%m/%d/%Y %H:%M",
+            "%m/%d/%Y",
+        ):
+            try:
+                return datetime.strptime(text, fmt)
+            except ValueError:
+                pass
+        try:
+            return datetime.fromisoformat(text)
+        except ValueError:
+            return None
+    return None
+
+
+def _coerce_score(value: Any) -> Optional[int]:
+    if value is None or value == "":
+        return None
+    try:
+        return int(float(value))
+    except Exception:
+        return None
+
+
+@app.post("/assessment-webhook")
+def assessment_webhook(payload: AssessmentWebhook, db: Session = Depends(get_db)):
+    learner = db.query(Learner).filter(Learner.email == payload.email).first()
+    if not learner:
+        raise HTTPException(status_code=404, detail="Learner not found for email")
+
+    assessment = _apply_assessment_result(
+        db=db,
+        learner=learner,
+        week=payload.week,
+        track=payload.track,
+        score=payload.score,
+    )
     db.commit()
     db.refresh(assessment)
 
-    return {"status": "saved", "assessment_id": assessment.id, "passed": passed}
+    return {
+        "status": "saved",
+        "assessment_id": assessment.id,
+        "passed": payload.score >= PASSING_SCORE,
+    }
+
+
+@app.post("/sync-assessments-from-excel")
+def sync_assessments_from_excel(payload: ExcelSyncInput, db: Session = Depends(get_db)):
+    file_path = os.path.join(os.path.dirname(__file__), payload.filename)
+    if not os.path.exists(file_path):
+        raise HTTPException(status_code=404, detail=f"Excel file not found: {payload.filename}")
+
+    wb = load_workbook(filename=file_path, data_only=True)
+    ws = wb.active
+
+    header_row = next(ws.iter_rows(min_row=1, max_row=1, values_only=True), None)
+    if not header_row:
+        raise HTTPException(status_code=400, detail="Excel file is empty")
+
+    headers = {str(value).strip(): idx for idx, value in enumerate(header_row) if value is not None}
+    required = ["Email", "Score", "Date"]
+    missing = [name for name in required if name not in headers]
+    if missing:
+        raise HTTPException(status_code=400, detail=f"Missing required Excel columns: {', '.join(missing)}")
+
+    created = 0
+    skipped: List[Dict[str, Any]] = []
+
+    for row_number, values in enumerate(ws.iter_rows(min_row=2, values_only=True), start=2):
+        email_raw = values[headers["Email"]] if headers["Email"] < len(values) else None
+        score_raw = values[headers["Score"]] if headers["Score"] < len(values) else None
+        date_raw = values[headers["Date"]] if headers["Date"] < len(values) else None
+
+        email = str(email_raw).strip() if email_raw is not None else ""
+        score = _coerce_score(score_raw)
+        submitted_at = _parse_excel_datetime(date_raw)
+
+        if not email or score is None:
+            skipped.append({"row": row_number, "reason": "Missing email or score"})
+            continue
+
+        learner = db.query(Learner).filter(Learner.email == email).first()
+        if not learner:
+            skipped.append({"row": row_number, "email": email, "reason": "Learner not found"})
+            continue
+
+        duplicate_query = db.query(Assessment).filter(
+            Assessment.learner_id == learner.id,
+            Assessment.week == payload.week,
+            Assessment.track == payload.track,
+            Assessment.score == score,
+        )
+        if submitted_at is not None:
+            duplicate_query = duplicate_query.filter(Assessment.submitted_at == submitted_at)
+
+        if duplicate_query.first() is not None:
+            skipped.append({"row": row_number, "email": email, "reason": "Duplicate assessment"})
+            continue
+
+        _apply_assessment_result(
+            db=db,
+            learner=learner,
+            week=payload.week,
+            track=payload.track,
+            score=score,
+            submitted_at=submitted_at,
+        )
+        created += 1
+
+    db.commit()
+    return {
+        "status": "ok",
+        "created": created,
+        "skipped": skipped,
+    }
 
 
 @app.get("/learners", response_model=List[LearnerOut])
