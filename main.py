@@ -8,6 +8,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import Column, Integer, String, Date, DateTime, ForeignKey, create_engine, func
 from sqlalchemy.orm import Session, declarative_base, sessionmaker, relationship
+from io import BytesIO
+from urllib.request import urlopen
+
 from openpyxl import load_workbook
 
 try:
@@ -92,7 +95,8 @@ class AssessmentWebhook(BaseModel):
 
 
 class ExcelSyncInput(BaseModel):
-    filename: str = "assessment_results.xlsx"
+    filename: Optional[str] = "assessment_results.xlsx"
+    source_url: Optional[str] = None
     week: int = Field(default=1, ge=1, le=7)
     track: str = "engineer"
 
@@ -406,13 +410,31 @@ def assessment_webhook(payload: AssessmentWebhook, db: Session = Depends(get_db)
     }
 
 
+GOOGLE_EXPORT_XLSX_URL = os.getenv("GOOGLE_EXPORT_XLSX_URL")
+
+
 @app.post("/sync-assessments-from-excel")
 def sync_assessments_from_excel(payload: ExcelSyncInput, db: Session = Depends(get_db)):
-    file_path = os.path.join(os.path.dirname(__file__), payload.filename)
-    if not os.path.exists(file_path):
-        raise HTTPException(status_code=404, detail=f"Excel file not found: {payload.filename}")
+    source_url = (payload.source_url or GOOGLE_EXPORT_XLSX_URL or "").strip()
 
-    wb = load_workbook(filename=file_path, data_only=True)
+    if source_url:
+        try:
+            with urlopen(source_url) as response:
+                content = response.read()
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Could not download Excel file from source_url: {e}")
+
+        wb = load_workbook(filename=BytesIO(content), data_only=True)
+    else:
+        if not payload.filename:
+            raise HTTPException(status_code=400, detail="Provide source_url or filename")
+
+        file_path = os.path.join(os.path.dirname(__file__), payload.filename)
+        if not os.path.exists(file_path):
+            raise HTTPException(status_code=404, detail=f"Excel file not found: {payload.filename}")
+
+        wb = load_workbook(filename=file_path, data_only=True)
+
     ws = wb.active
 
     header_row = next(ws.iter_rows(min_row=1, max_row=1, values_only=True), None)
